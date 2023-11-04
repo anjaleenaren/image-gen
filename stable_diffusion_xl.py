@@ -17,7 +17,9 @@
 
 from pathlib import Path
 
-from modal import Image, Mount, Stub, asgi_app, gpu, method
+from modal import Image, Mount, Stub, asgi_app, gpu, method, Secret
+
+s3_secret = Secret.from_name("anj-aws-secret")
 
 # ## Define a container image
 #
@@ -52,10 +54,12 @@ image = (
         "accelerate~=0.21",
         "safetensors~=0.3",
     )
+    .pip_install("boto3")
     .run_function(download_models)
 )
 
 stub = Stub("stable-diffusion-xl", image=image)
+BUCKET_NAME = 'anj-image-gen-images'
 
 # ## Load model and run inference
 #
@@ -66,8 +70,9 @@ stub = Stub("stable-diffusion-xl", image=image)
 # online for 4 minutes before spinning down. This can be adjusted for cost/experience trade-offs.
 
 
-@stub.cls(gpu=gpu.A10G(), container_idle_timeout=240)
+@stub.cls(gpu=gpu.A10G(), secrets=[s3_secret], container_idle_timeout=240)
 class Model:
+    # Define your S3 Bucket name, just the name, not the ARN or URL
     def __enter__(self):
         import torch
         from diffusers import DiffusionPipeline
@@ -94,9 +99,54 @@ class Model:
 
         # Compiling the model graph is JIT so this will increase inference time for the first run
         # but speed up subsequent runs. Uncomment to enable.
-        self.base.unet = torch.compile(self.base.unet, mode="reduce-overhead", fullgraph=True)
-        self.refiner.unet = torch.compile(self.refiner.unet, mode="reduce-overhead", fullgraph=True)
+        # self.base.unet = torch.compile(self.base.unet, mode="reduce-overhead", fullgraph=True)
+        # self.refiner.unet = torch.compile(self.refiner.unet, mode="reduce-overhead", fullgraph=True)
+    @method()
+    def download_from_s3(self, bucket_name, s3_key, local_path):
+        import boto3
+        
+        """
+        Download a file from S3 to the given local path.
 
+        :param bucket_name: The name of the S3 bucket.
+        :param s3_key: The key of the file in the S3 bucket.
+        :param local_path: The local path where the file should be saved.
+        """
+        s3_client = boto3.client('s3')
+
+        s3_client.download_file(bucket_name, s3_key, local_path)
+        print(f"File downloaded successfully: {local_path}")
+
+    @method()
+    def upload_to_s3(self, image_bytes):
+        import os
+        import boto3
+        from botocore.exceptions import NoCredentialsError
+        import uuid
+        # Ensure the temp directory exists
+        import os
+        # Ensure the temp directory exists
+        temp_dir = "temp"
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+            
+        # Generate a unique file name
+        filename = f"{uuid.uuid4()}.png"
+        temp_file_path = os.path.join(temp_dir, filename)
+        
+        # Save the image temporarily
+        with open(temp_file_path, "wb") as temp_file:
+            temp_file.write(image_bytes)
+
+        s3_client = boto3.client("s3")
+        # s3_client.create_bucket(Bucket=BUCKET_NAME)
+        ret = s3_client.upload_file(temp_file_path, BUCKET_NAME, filename)
+        print("S3 ret: ", ret)
+        file_url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{filename}"
+        print("Uploaded to S3: ", filename)
+
+        return filename
+    
     @method()
     def inference(self, prompt, n_steps=24, high_noise_frac=0.8):
         negative_prompt = "disfigured, ugly, deformed"
@@ -129,17 +179,18 @@ class Model:
 
 
 @stub.local_entrypoint()
-def main(prompt: str):
-    image_bytes = Model().inference.remote(prompt)
+def main():
+    # image_bytes = Model().inference.remote(prompt)
 
     dir = Path("/tmp/stable-diffusion-xl")
     if not dir.exists():
         dir.mkdir(exist_ok=True, parents=True)
 
-    output_path = dir / "output.png"
+    output_path = dir #/ "output.png"
     print(f"Saving it to {output_path}")
-    with open(output_path, "wb") as f:
-        f.write(image_bytes)
+    # with open(output_path, "wb") as f:
+        # f.write(image_bytes)
+    Model().download_from_s3.remote(BUCKET_NAME, 'c2fb43cd-ab56-4b26-a3c6-a027ab1b54b7.png', output_path)
 
 
 # ## A user interface
@@ -170,6 +221,8 @@ def app():
         from fastapi.responses import Response
 
         image_bytes = Model().inference.remote(prompt)
+
+        s3_key = Model().upload_to_s3.remote(image_bytes)
 
         return Response(image_bytes, media_type="image/png")
 
