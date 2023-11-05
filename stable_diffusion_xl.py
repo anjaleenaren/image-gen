@@ -20,6 +20,12 @@ from pathlib import Path
 from modal import Image, Mount, Stub, asgi_app, gpu, method, Secret
 
 s3_secret = Secret.from_name("anj-aws-secret")
+class ImageModel():
+    def __init__(self, s3_key: str, metadata: dict, user_id: str):
+        self.s3_key = s3_key
+        self.metadata = metadata
+        self.user_id = user_id  # Assuming i add user auth later
+
 
 # ## Define a container image
 #
@@ -54,6 +60,7 @@ image = (
         "accelerate~=0.21",
         "safetensors~=0.3",
     )
+    .pip_install("motor", "odmantic", "pymongo",)
     .pip_install("boto3")
     .run_function(download_models)
 )
@@ -179,8 +186,18 @@ class Model:
 
 
 @stub.local_entrypoint()
-def main():
+def main(prompt: str):
+    from motor.motor_asyncio import AsyncIOMotorClient
+    from odmantic import AIOEngine, Model
+    from pydantic import BaseModel
+    db_client = AsyncIOMotorClient("mongodb://localhost:27017")  # Replace with your MongoDB URI
+    engine = AIOEngine(client=db_client, database="image_gen")
     # image_bytes = Model().inference.remote(prompt)
+
+    image_bytes = Model().inference.remote(prompt)
+
+    s3_key = Model().upload_to_s3.remote(image_bytes)
+    image = ImageModel(s3_key=s3_key, metadata={}, user_id="1")
 
     dir = Path("/tmp/stable-diffusion-xl")
     if not dir.exists():
@@ -213,8 +230,14 @@ frontend_path = Path(__file__).parent / "frontend"
 def app():
     import fastapi.staticfiles
     from fastapi import FastAPI
+    from motor.motor_asyncio import AsyncIOMotorClient
+    from odmantic import AIOEngine, Model
+    from pydantic import BaseModel
 
     web_app = FastAPI()
+
+    # db_client = AsyncIOMotorClient("mongodb://localhost:27017")  # Replace with your MongoDB URI
+    # engine = AIOEngine(client=db_client, database="image_gen")
 
     @web_app.get("/infer/{prompt}")
     async def infer(prompt: str):
@@ -224,7 +247,21 @@ def app():
 
         s3_key = Model().upload_to_s3.remote(image_bytes)
 
+        image = ImageModel(s3_key=s3_key, metadata={}, user_id="1")
+        # await engine.save(image)
+
         return Response(image_bytes, media_type="image/png")
+    
+    # @web_app.get("/image/{s3_id}")
+    # async def image(s3_id: str):
+    #     from fastapi.responses import Response
+
+    #     image_bytes = Model().download_from_s3.remote(BUCKET_NAME, s3_id)
+
+    #     image = ImageModel(s3_key=s3_key, metadata={}, user_id="1")
+    #     await engine.save(image)
+
+    #     return Response(image_bytes, media_type="image/png")
 
     web_app.mount(
         "/", fastapi.staticfiles.StaticFiles(directory="/assets", html=True)
