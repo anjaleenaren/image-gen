@@ -16,9 +16,10 @@
 # ## Basic setup
 
 from pathlib import Path
+import pathlib
 
-from modal import Image, Mount, Stub, asgi_app, gpu, method, Secret
-
+from modal import Image, Mount, Stub, asgi_app, gpu, method, Secret, Volume
+import datetime
 s3_secret = Secret.from_name("anj-aws-secret")
 
 # ## Define a container image
@@ -47,6 +48,7 @@ image = (
     .apt_install(
         "libglib2.0-0", "libsm6", "libxrender1", "libxext6", "ffmpeg", "libgl1"
     )
+    # .apt_install("sqlite3")
     .pip_install(
         "diffusers~=0.19",
         "invisible_watermark~=0.1",
@@ -55,11 +57,17 @@ image = (
         "safetensors~=0.3",
     )
     .pip_install("boto3")
+    .pip_install("datasette~=0.63.2", "sqlite-utils")
     .run_function(download_models)
 )
 
 stub = Stub("stable-diffusion-xl", image=image)
 BUCKET_NAME = 'anj-image-gen-images'
+
+stub.volume = Volume.persisted("image-gen-cache-vol")
+
+VOLUME_DIR = "/cache-vol"
+DB_PATH = pathlib.Path(VOLUME_DIR, "image-gen.db")
 
 # ## Load model and run inference
 #
@@ -69,8 +77,8 @@ BUCKET_NAME = 'anj-image-gen-images'
 # To avoid excessive cold-starts, we set the idle timeout to 240 seconds, meaning once a GPU has loaded the model it will stay
 # online for 4 minutes before spinning down. This can be adjusted for cost/experience trade-offs.
 
-
-@stub.cls(gpu=gpu.A10G(), secrets=[s3_secret], container_idle_timeout=240)
+#TODO: Can speed up inference by switching too A100
+@stub.cls(gpu=gpu.A10G(), secrets=[s3_secret], container_idle_timeout=240, volumes={VOLUME_DIR: stub.volume})
 class Model:
     # Define your S3 Bucket name, just the name, not the ARN or URL
     def __enter__(self):
@@ -97,10 +105,54 @@ class Model:
             **load_options,
         )
 
+        # Setup db #####################
+        import sqlite_utils
+        # Create the database if it doesn't exist
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite_utils.Database(DB_PATH)
+        self.table = self.db["image-gen"]
+        self.table.create({  
+            "id": int,
+            "image_s3": str,
+            "user": str,
+            "prompt": str,
+            "metadata": str,
+            "created_at": str,
+            "updated_at": str,
+        }, pk="id", if_not_exists=True) #, foreign_keys=("user"))
+        self.table.create_index(["image_s3"], if_not_exists=True)
+        self.table.create_index(["user"], if_not_exists=True)
+        self.table.create_index(["prompt"], if_not_exists=True)
+        self.table.create_index(["metadata"], if_not_exists=True)
+        self.db.close()
+        #Sync db with volume (cache)
+        # stub.volume.commit()
+        #################################
+
         # Compiling the model graph is JIT so this will increase inference time for the first run
         # but speed up subsequent runs. Uncomment to enable.
         # self.base.unet = torch.compile(self.base.unet, mode="reduce-overhead", fullgraph=True)
         # self.refiner.unet = torch.compile(self.refiner.unet, mode="reduce-overhead", fullgraph=True)
+
+    # @method()
+    def push_img_to_db(self, image_s3, prompt, user=None, metadata=None):
+        import sqlite_utils
+        # Create the database if it doesn't exist
+        # DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite_utils.Database(DB_PATH)
+        self.table = self.db["image-gen"]
+        self.table.insert({
+            "image_s3": image_s3,
+            "user": user,
+            "prompt": prompt,
+            "metadata": metadata,
+            "created_at": str(datetime.datetime.now()),
+            "updated_at": str(datetime.datetime.now()),
+        })
+        self.db.close()
+        #Sync db with volume (cache)
+        stub.volume.commit()
+    
     @method()
     def download_from_s3(self, bucket_name, s3_key, local_path):
         import boto3
@@ -179,18 +231,36 @@ class Model:
 
 
 @stub.local_entrypoint()
-def main():
-    # image_bytes = Model().inference.remote(prompt)
+def main(prompt: str):
+    print("start main")
+    image_bytes = Model().inference.remote(prompt)
+    s3_key = Model().upload_to_s3.remote(image_bytes)
+    # import sqlite_utils
+    # # Create the database if it doesn't exist
+    # db = sqlite_utils.Database(DB_PATH)
+    # table = db["image-gen"]
+    # table.insert({
+    #     "image_s3": s3_key,
+    #     "user": "1",
+    #     "prompt": prompt,
+    #     "metadata": "{}",
+    #     "created_at": str(datetime.datetime.now()),
+    #     "updated_at": str(datetime.datetime.now()),
+    # })
+    # db.close()
+    # #Sync db with volume (cache)
+    # stub.volume.commit()
+    
 
-    dir = Path("/tmp/stable-diffusion-xl")
-    if not dir.exists():
-        dir.mkdir(exist_ok=True, parents=True)
+    # dir = Path("/tmp/stable-diffusion-xl")
+    # if not dir.exists():
+    #     dir.mkdir(exist_ok=True, parents=True)
 
-    output_path = dir #/ "output.png"
-    print(f"Saving it to {output_path}")
-    # with open(output_path, "wb") as f:
-        # f.write(image_bytes)
-    Model().download_from_s3.remote(BUCKET_NAME, 'c2fb43cd-ab56-4b26-a3c6-a027ab1b54b7.png', output_path)
+    # output_path = dir #/ "output.png"
+    # print(f"Saving it to {output_path}")
+    # # with open(output_path, "wb") as f:
+    #     # f.write(image_bytes)
+    # Model().download_from_s3.remote(BUCKET_NAME, 'c2fb43cd-ab56-4b26-a3c6-a027ab1b54b7.png', output_path)
 
 
 # ## A user interface
@@ -208,13 +278,20 @@ frontend_path = Path(__file__).parent / "frontend"
 @stub.function(
     mounts=[Mount.from_local_dir(frontend_path, remote_path="/assets")],
     allow_concurrent_inputs=20,
+    cpu=0.5, #default is 0.1, make 1 on live deploy
+    volumes={VOLUME_DIR: stub.volume}
 )
 @asgi_app()
 def app():
     import fastapi.staticfiles
     from fastapi import FastAPI
+    from sqlite3 import connect
+    from datasette.app import Datasette
+
 
     web_app = FastAPI()
+    ds = Datasette(files=[DB_PATH], settings={"sql_time_limit_ms": 10000})
+    
 
     @web_app.get("/infer/{prompt}")
     async def infer(prompt: str):
@@ -223,6 +300,7 @@ def app():
         image_bytes = Model().inference.remote(prompt)
 
         s3_key = Model().upload_to_s3.remote(image_bytes)
+        Model().push_img_to_db(s3_key, prompt)
 
         return Response(image_bytes, media_type="image/png")
 
