@@ -55,6 +55,7 @@ image = (
         "safetensors~=0.3",
     )
     .pip_install("boto3")
+    # .pip_install("motor", "odmantic", "pymongo",)
     .run_function(download_models)
 )
 
@@ -212,9 +213,22 @@ frontend_path = Path(__file__).parent / "frontend"
 @asgi_app()
 def app():
     import fastapi.staticfiles
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException
+    from motor.motor_asyncio import AsyncIOMotorClient
+    from odmantic import AIOEngine, Model
+    from pydantic import BaseModel
 
     web_app = FastAPI()
+
+    # class ImageModel(Model):
+    #     s3_key: str
+    #     metadata: dict
+    #     user_id: str  # Assuming you have user authentication
+    # db_client = AsyncIOMotorClient("mongodb://localhost:27017")  # Replace with your MongoDB URI
+    # engine = AIOEngine(client=db_client, database='image_gen')
+    # mongodb = db_client.image_gen
+    
+
 
     @web_app.get("/infer/{prompt}")
     async def infer(prompt: str):
@@ -223,6 +237,8 @@ def app():
         image_bytes = Model().inference.remote(prompt)
 
         s3_key = Model().upload_to_s3.remote(image_bytes)
+        # image = ImageModel(s3_key=s3_key, metadata={}, user_id="test")
+        # engine.save(image)
 
         return Response(image_bytes, media_type="image/png")
 
