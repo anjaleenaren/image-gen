@@ -64,6 +64,22 @@
     </div>
 
     <script>
+      function base64ToBlob(base64, mimeType) {
+        // Convert base64/URLEncoded data component to raw binary data held in a string
+        const byteString = atob(base64);
+
+        // Write the bytes of the string to an ArrayBuffer
+        const arrayBuffer = new ArrayBuffer(byteString.length);
+        const intArray = new Uint8Array(arrayBuffer);
+
+        for (let i = 0; i < byteString.length; i++) {
+          intArray[i] = byteString.charCodeAt(i);
+        }
+
+        // Write the ArrayBuffer to a blob, and you're done
+        return new Blob([intArray], { type: mimeType });
+      }
+
       function state() {
         return {
           prompt: "a beautiful Japanese temple, butterflies flying around",
@@ -81,9 +97,24 @@
             const queryString = new URLSearchParams(
               this.features.map((f) => ["features", f])
             ).toString();
-            const res = await fetch(`/infer/${this.submitted}?${queryString}`);
+            // Todo: Push img object to db (prompt, metadata, id)
+            // const push_res = await fetch(`/save-new-img/${this.submitted}?${queryString}`);
+            // if (push_res.status !== 200) throw new Error("An error occurred: " + resp.status);
+            // const push_res_json = await push_res.json();
+            // console.log("JSON")
+            // console.log("json ", push_res_json?.id)
 
-            const blob = await res.blob();
+            // Hit /infer to create the image and add s3_key to it
+            const response = await fetch(
+              `/infer/${this.submitted}?${queryString}`
+            );
+            const data = await response.json();
+            const { id, image } = data;
+            console.log("Image ID:", id);
+
+            // ADD SHARE BUTTON. ONCLICK, IT WILL RETURN /image/:s3_key (with the s3_key inserted)
+            const blob = base64ToBlob(image, "image/png");
+            // const blob = await res.blob();
             this.imageURL = URL.createObjectURL(blob);
             this.loading = false;
             console.log(this.imageURL);

@@ -135,23 +135,65 @@ class Model:
         # self.refiner.unet = torch.compile(self.refiner.unet, mode="reduce-overhead", fullgraph=True)
 
     # @method()
-    def push_img_to_db(self, image_s3, prompt, user=None, metadata=None):
+    def push_img_to_db(self, image_s3, prompt, id=None, user=None, metadata=None):
         import sqlite_utils
-        # Create the database if it doesn't exist
-        # DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite_utils.Database(DB_PATH)
         self.table = self.db["image-gen"]
-        self.table.insert({
+        data = {
             "image_s3": image_s3,
             "user": user,
             "prompt": prompt,
             "metadata": metadata,
-            "created_at": str(datetime.datetime.now()),
-            "updated_at": str(datetime.datetime.now()),
-        })
+            "updated_at": str(datetime.datetime.now())
+        }
+
+        image_id = None
+        if id is not None:  # Update existing record
+            self.db["image-gen"].upsert(data, pk="id")  # Assuming 'id' is the primary key
+            image_id = id
+        else:  # Insert new record
+            data["created_at"] = str(datetime.datetime.now())
+            image_id = self.db["image-gen"].insert(data).last_pk
+
         self.db.close()
         #Sync db with volume (cache)
         stub.volume.commit()
+
+        return image_id
+    
+    def get_img_from_db(self, s3_key: str):
+        import sqlite3
+        import boto3
+        from botocore.exceptions import ClientError
+
+        # Connect to the SQLite database
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # Retrieve the image URL from the database using the s3_key
+        try:
+            cursor.execute("SELECT image_s3 FROM image_gen WHERE s3_key = ?", (s3_key,))
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError("No image found with the provided s3_key.")
+            image_s3_url = row[0]
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+        finally:
+            cursor.close()
+            conn.close()
+
+        # Download the image from S3 using the URL
+        s3_client = boto3.client('s3')
+
+        # Extract bucket name and file key from the S3 URL
+        bucket_name = BUCKET_NAME  # Assuming you have a single bucket for images
+
+        local_filename = f"/tmp/{s3_key}"  # Temporary local file path to save the downloaded image
+        s3_client.download_file(bucket_name, file_key, local_filename)
+
+        return local_filename
+
     
     @method()
     def download_from_s3(self, bucket_name, s3_key, local_path):
@@ -200,7 +242,7 @@ class Model:
         return filename
     
     @method()
-    def inference(self, prompt, n_steps=24, high_noise_frac=0.8):
+    def inference(self, prompt, n_steps=24, high_noise_frac=0.8): #Change n_steps to 24
         negative_prompt = "disfigured, ugly, deformed"
         image = self.base(
             prompt=prompt,
@@ -291,18 +333,29 @@ def app():
 
     web_app = FastAPI()
     ds = Datasette(files=[DB_PATH], settings={"sql_time_limit_ms": 10000})
+
+    @web_app.get("/save-new-img/{prompt}")
+    async def save_new_image(prompt: str):
+        from fastapi.responses import Response, JSONResponse
+        image_id = Model().push_img_to_db(None, prompt)
+        print(image_id)
+
+        return {"id": image_id}
     
 
     @web_app.get("/infer/{prompt}")
     async def infer(prompt: str):
-        from fastapi.responses import Response
+        from fastapi.responses import Response, JSONResponse
+        import base64
 
         image_bytes = Model().inference.remote(prompt)
 
         s3_key = Model().upload_to_s3.remote(image_bytes)
-        Model().push_img_to_db(s3_key, prompt)
+        image_id = Model().push_img_to_db(s3_key, prompt)
 
-        return Response(image_bytes, media_type="image/png")
+        # return Response(image_bytes, media_type="image/png")
+        encoded_image = base64.b64encode(image_bytes).decode('utf-8')
+        return JSONResponse(content={"id": image_id, "image": encoded_image})
 
     web_app.mount(
         "/", fastapi.staticfiles.StaticFiles(directory="/assets", html=True)
