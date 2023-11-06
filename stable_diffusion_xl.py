@@ -17,9 +17,10 @@
 
 from pathlib import Path
 import pathlib
-
+import tempfile
 from modal import Image, Mount, Stub, asgi_app, gpu, method, Secret, Volume
 import datetime
+
 s3_secret = Secret.from_name("anj-aws-secret")
 
 # ## Define a container image
@@ -62,7 +63,7 @@ image = (
 )
 
 stub = Stub("stable-diffusion-xl", image=image)
-BUCKET_NAME = 'anj-image-gen-images'
+BUCKET_NAME = "anj-image-gen-images"
 
 stub.volume = Volume.persisted("image-gen-cache-vol")
 
@@ -77,8 +78,14 @@ DB_PATH = pathlib.Path(VOLUME_DIR, "image-gen.db")
 # To avoid excessive cold-starts, we set the idle timeout to 240 seconds, meaning once a GPU has loaded the model it will stay
 # online for 4 minutes before spinning down. This can be adjusted for cost/experience trade-offs.
 
-#TODO: Can speed up inference by switching too A100
-@stub.cls(gpu=gpu.A10G(), secrets=[s3_secret], container_idle_timeout=240, volumes={VOLUME_DIR: stub.volume})
+
+# TODO: Can speed up inference by switching too A100
+@stub.cls(
+    gpu=gpu.A10G(),
+    secrets=[s3_secret],
+    container_idle_timeout=240,
+    volumes={VOLUME_DIR: stub.volume},
+)
 class Model:
     # Define your S3 Bucket name, just the name, not the ARN or URL
     def __enter__(self):
@@ -107,25 +114,30 @@ class Model:
 
         # Setup db #####################
         import sqlite_utils
+
         # Create the database if it doesn't exist
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite_utils.Database(DB_PATH)
         self.table = self.db["image-gen"]
-        self.table.create({  
-            "id": int,
-            "image_s3": str,
-            "user": str,
-            "prompt": str,
-            "metadata": str,
-            "created_at": str,
-            "updated_at": str,
-        }, pk="id", if_not_exists=True) #, foreign_keys=("user"))
+        self.table.create(
+            {
+                "id": int,
+                "image_s3": str,
+                "user": str,
+                "prompt": str,
+                "metadata": str,
+                "created_at": str,
+                "updated_at": str,
+            },
+            pk="id",
+            if_not_exists=True,
+        )  # , foreign_keys=("user"))
         self.table.create_index(["image_s3"], if_not_exists=True)
         self.table.create_index(["user"], if_not_exists=True)
         self.table.create_index(["prompt"], if_not_exists=True)
         self.table.create_index(["metadata"], if_not_exists=True)
         self.db.close()
-        #Sync db with volume (cache)
+        # Sync db with volume (cache)
         # stub.volume.commit()
         #################################
 
@@ -137,6 +149,7 @@ class Model:
     # @method()
     def push_img_to_db(self, image_s3, prompt, id=None, user=None, metadata=None):
         import sqlite_utils
+
         self.db = sqlite_utils.Database(DB_PATH)
         self.table = self.db["image-gen"]
         data = {
@@ -144,61 +157,87 @@ class Model:
             "user": user,
             "prompt": prompt,
             "metadata": metadata,
-            "updated_at": str(datetime.datetime.now())
+            "updated_at": str(datetime.datetime.now()),
         }
 
         image_id = None
         if id is not None:  # Update existing record
-            self.db["image-gen"].upsert(data, pk="id")  # Assuming 'id' is the primary key
+            self.db["image-gen"].upsert(
+                data, pk="id"
+            )  # Assuming 'id' is the primary key
             image_id = id
         else:  # Insert new record
             data["created_at"] = str(datetime.datetime.now())
             image_id = self.db["image-gen"].insert(data).last_pk
 
         self.db.close()
-        #Sync db with volume (cache)
+        # Sync db with volume (cache)
         stub.volume.commit()
 
         return image_id
-    
-    def get_img_from_db(self, s3_key: str):
-        import sqlite3
-        import boto3
-        from botocore.exceptions import ClientError
 
-        # Connect to the SQLite database
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        # Retrieve the image URL from the database using the s3_key
-        try:
-            cursor.execute("SELECT image_s3 FROM image_gen WHERE s3_key = ?", (s3_key,))
-            row = cursor.fetchone()
-            if row is None:
-                raise ValueError("No image found with the provided s3_key.")
-            image_s3_url = row[0]
-        except sqlite3.Error as e:
-            print(f"Database error: {e}")
-        finally:
-            cursor.close()
-            conn.close()
-
-        # Download the image from S3 using the URL
-        s3_client = boto3.client('s3')
-
-        # Extract bucket name and file key from the S3 URL
-        bucket_name = BUCKET_NAME  # Assuming you have a single bucket for images
-
-        local_filename = f"/tmp/{s3_key}"  # Temporary local file path to save the downloaded image
-        s3_client.download_file(bucket_name, file_key, local_filename)
-
-        return local_filename
-
-    
     @method()
-    def download_from_s3(self, bucket_name, s3_key, local_path):
+    def get_img_from_db(self, image_id):
+        from PIL import Image
+        from sqlite3 import connect
         import boto3
-        
+        import sqlite_utils
+        import io
+        import os
+        import base64
+        from fastapi.responses import Response, JSONResponse
+
+        self.db = sqlite_utils.Database(DB_PATH)
+
+        record = self.db["image-gen"].get(image_id)
+
+        # If the row is found, proceed to download from S3
+        if record:
+            image_s3 = record["image_s3"]
+            metadata = record["metadata"]
+            created_at = record["created_at"]
+            prompt = record["prompt"]
+            print(image_s3, metadata, created_at, prompt)
+            s3_client = boto3.client("s3")
+
+            # Download the image file from S3 into the buffer
+            with tempfile.TemporaryDirectory() as td:
+                full_path = os.path.join(td, image_s3)
+                with open(full_path, "wb") as tmp_file:
+                    s3_client.download_fileobj(
+                        BUCKET_NAME,
+                        image_s3,
+                        tmp_file,
+                    )
+                # Convert to an image
+                with open(full_path, "rb") as image_file:
+                    with Image.open(image_file) as img:
+                        byte_stream = io.BytesIO()
+                        img.save(byte_stream, format="PNG")
+                        
+            image_bytes = byte_stream.getvalue()
+            encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+            print("Encoded image: ", encoded_image)
+            return JSONResponse(
+                content={
+                    "id": image_id,
+                    "s3": image_s3,
+                    "metadata": metadata,
+                    "created_at": created_at,
+                    "prompt": prompt,
+                    "image": encoded_image,
+                }
+            )
+            # return image_bytes
+        else:
+            # Handle the case where there is no record with the given ID
+            print("No matching record found for image id: ", image_id)
+            return None
+
+    @method()
+    def download_from_s3(self, bucket_name, s3_key, image_bytes_buffer):
+        import boto3
+
         """
         Download a file from S3 to the given local path.
 
@@ -206,10 +245,17 @@ class Model:
         :param s3_key: The key of the file in the S3 bucket.
         :param local_path: The local path where the file should be saved.
         """
-        s3_client = boto3.client('s3')
+        s3_client = boto3.client("s3")
 
-        s3_client.download_file(bucket_name, s3_key, local_path)
-        print(f"File downloaded successfully: {local_path}")
+        # local_path = str(Path("/tmp/stable-diffusion-xl") / s3_key)
+        # Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # s3_client.download_file(bucket_name, s3_key, local_path)
+        ret = s3_client.download_fileobj(bucket_name, s3_key, image_bytes_buffer)
+        print("S3 ret: ", ret)
+        # print(f"File downloaded successfully from S3: {s3_key}")
+
+        # return local_path
 
     @method()
     def upload_to_s3(self, image_bytes):
@@ -217,17 +263,19 @@ class Model:
         import boto3
         from botocore.exceptions import NoCredentialsError
         import uuid
+
         # Ensure the temp directory exists
         import os
+
         # Ensure the temp directory exists
         temp_dir = "temp"
         if not os.path.exists(temp_dir):
             os.makedirs(temp_dir)
-            
+
         # Generate a unique file name
         filename = f"{uuid.uuid4()}.png"
         temp_file_path = os.path.join(temp_dir, filename)
-        
+
         # Save the image temporarily
         with open(temp_file_path, "wb") as temp_file:
             temp_file.write(image_bytes)
@@ -240,9 +288,11 @@ class Model:
         print("Uploaded to S3: ", filename)
 
         return filename
-    
+
     @method()
-    def inference(self, prompt, n_steps=24, high_noise_frac=0.8): #Change n_steps to 24
+    def inference(
+        self, prompt, n_steps=24, high_noise_frac=0.8
+    ):  # Change n_steps to 24
         negative_prompt = "disfigured, ugly, deformed"
         image = self.base(
             prompt=prompt,
@@ -292,17 +342,14 @@ def main(prompt: str):
     # db.close()
     # #Sync db with volume (cache)
     # stub.volume.commit()
-    
 
-    # dir = Path("/tmp/stable-diffusion-xl")
-    # if not dir.exists():
-    #     dir.mkdir(exist_ok=True, parents=True)
-
-    # output_path = dir #/ "output.png"
-    # print(f"Saving it to {output_path}")
-    # # with open(output_path, "wb") as f:
-    #     # f.write(image_bytes)
-    # Model().download_from_s3.remote(BUCKET_NAME, 'c2fb43cd-ab56-4b26-a3c6-a027ab1b54b7.png', output_path)
+    dir = Path("/tmp/stable-diffusion-xl")
+    if not dir.exists():
+        dir.mkdir(exist_ok=True, parents=True)
+    output_path = dir  # / "output.png"
+    Model().download_from_s3.remote(
+        BUCKET_NAME, "c2fb43cd-ab56-4b26-a3c6-a027ab1b54b7.png", output_path
+    )
 
 
 # ## A user interface
@@ -320,8 +367,8 @@ frontend_path = Path(__file__).parent / "frontend"
 @stub.function(
     mounts=[Mount.from_local_dir(frontend_path, remote_path="/assets")],
     allow_concurrent_inputs=20,
-    cpu=0.5, #default is 0.1, make 1 on live deploy
-    volumes={VOLUME_DIR: stub.volume}
+    cpu=1,  # default is 0.1, make 1 on live deploy
+    volumes={VOLUME_DIR: stub.volume},
 )
 @asgi_app()
 def app():
@@ -330,18 +377,17 @@ def app():
     from sqlite3 import connect
     from datasette.app import Datasette
 
-
     web_app = FastAPI()
     ds = Datasette(files=[DB_PATH], settings={"sql_time_limit_ms": 10000})
 
     @web_app.get("/save-new-img/{prompt}")
     async def save_new_image(prompt: str):
         from fastapi.responses import Response, JSONResponse
+
         image_id = Model().push_img_to_db(None, prompt)
         print(image_id)
 
         return {"id": image_id}
-    
 
     @web_app.get("/infer/{prompt}")
     async def infer(prompt: str):
@@ -354,11 +400,18 @@ def app():
         image_id = Model().push_img_to_db(s3_key, prompt)
 
         # return Response(image_bytes, media_type="image/png")
-        encoded_image = base64.b64encode(image_bytes).decode('utf-8')
+        encoded_image = base64.b64encode(image_bytes).decode("utf-8")
         return JSONResponse(content={"id": image_id, "image": encoded_image})
 
+    @web_app.get("/image/{id}")
+    async def infer(id: str):
+        return Model().get_img_from_db.remote(id)
+
+    web_app.mount("/", fastapi.staticfiles.StaticFiles(directory="/assets", html=True))
+
     web_app.mount(
-        "/", fastapi.staticfiles.StaticFiles(directory="/assets", html=True)
+        "/infer{prompt}",
+        fastapi.staticfiles.StaticFiles(directory="/assets", html=True),
     )
 
     return web_app
