@@ -59,6 +59,8 @@ image = (
     )
     .pip_install("boto3")
     .pip_install("datasette~=0.63.2", "sqlite-utils")
+    .pip_install("Jinja2~=3.0.1")
+    .pip_install("jinja2")
     .run_function(download_models)
 )
 
@@ -217,17 +219,19 @@ class Model:
                         
             image_bytes = byte_stream.getvalue()
             encoded_image = base64.b64encode(image_bytes).decode("utf-8")
-            print("Encoded image: ", encoded_image)
-            return JSONResponse(
-                content={
-                    "id": image_id,
-                    "s3": image_s3,
-                    "metadata": metadata,
-                    "created_at": created_at,
-                    "prompt": prompt,
-                    "image": encoded_image,
-                }
-            )
+            # print("Encoded image: ", encoded_image)
+            content={
+                "id": image_id,
+                "s3": image_s3,
+                "metadata": metadata,
+                "created_at": created_at,
+                "prompt": prompt,
+                "image": encoded_image,
+            }
+            # return JSONResponse(
+            #     content
+            # )
+            return content
             # return image_bytes
         else:
             # Handle the case where there is no record with the given ID
@@ -293,7 +297,7 @@ class Model:
     def inference(
         self, prompt, n_steps=24, high_noise_frac=0.8
     ):  # Change n_steps to 24
-        negative_prompt = "disfigured, ugly, deformed"
+        negative_prompt = "disfigured, ugly, deformed, poor details, bad anatomy, blurry"
         image = self.base(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -373,7 +377,8 @@ frontend_path = Path(__file__).parent / "frontend"
 @asgi_app()
 def app():
     import fastapi.staticfiles
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
+    from fastapi.responses import HTMLResponse
     from sqlite3 import connect
     from datasette.app import Datasette
 
@@ -403,15 +408,14 @@ def app():
         encoded_image = base64.b64encode(image_bytes).decode("utf-8")
         return JSONResponse(content={"id": image_id, "image": encoded_image})
 
-    @web_app.get("/image/{id}")
-    async def infer(id: str):
-        return Model().get_img_from_db.remote(id)
+    @web_app.get("/image/{id}", response_class=HTMLResponse)
+    async def image(request: Request, id: str):
+        from fastapi.templating import Jinja2Templates
+        templates = Jinja2Templates(directory="/assets")
+        response_obj = Model().get_img_from_db.remote(id)
+        response_obj['request'] = request
+        return templates.TemplateResponse("index.html", response_obj)
 
     web_app.mount("/", fastapi.staticfiles.StaticFiles(directory="/assets", html=True))
-
-    web_app.mount(
-        "/infer{prompt}",
-        fastapi.staticfiles.StaticFiles(directory="/assets", html=True),
-    )
 
     return web_app
