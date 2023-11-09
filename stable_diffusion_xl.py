@@ -428,7 +428,7 @@ def app():
             "s3": "",
             "metadata": "",
             "created_at": "",
-            "prompt": "a beautiful Japanese temple, butterflies flying around, realistic, sunset",
+            "prompt": "a beautiful Japanese temple, realistic, sunset",
             "image": "",
             "request": request,
         }

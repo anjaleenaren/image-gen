@@ -8,7 +8,8 @@
 
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Image Generator 1.0</title>
-    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon" />
+    <link rel="icon" href="/favicon.ico" type="image/x-icon" />
   </head>
   <body x-data="state()">
     <div class="max-w-3xl mx-auto pt-4 pb-8 px-10 sm:py-12 sm:px-6 lg:px-8">
@@ -18,18 +19,21 @@
 
       <form
         @submit.prevent="submitPrompt"
-        class="flex items-center justify-center gap-x-4 gap-y-2 w-full mx-auto mb-4"
+        class="flex flex-col items-center justify-center gap-2 w-full mx-auto mb-4"
       >
-        <input
+        <textarea
           x-data
           x-model="prompt"
           x-init="$nextTick(() => { $el.focus(); });"
-          type="text"
-          class="flex w-full px-3 py-3 text-md bg-white border rounded-md border-neutral-300 ring-offset-background placeholder:text-neutral-500 focus:border-neutral-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-neutral-400 disabled:cursor-not-allowed disabled:opacity-50 text-center"
-        />
+          rows="1"
+          class="flex w-full px-3 py-3 text-md bg-white border rounded-md border-neutral-300 ring-offset-background placeholder:text-neutral-500 focus:border-neutral-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-neutral-400 disabled:cursor-not-allowed disabled:opacity-50 text-center resize-none overflow-hidden"
+          style="min-height: 3rem; height: auto"
+          @input="$el.style.height = 'auto'; $el.style.height = $el.scrollHeight + 'px';"
+        ></textarea>
         <button
           type="submit"
           class="inline-flex items-center justify-center px-4 py-3 tracking-wide text-white transition-colors duration-200 rounded-md bg-neutral-950 hover:bg-neutral-900 focus:ring-2 focus:ring-offset-2 focus:ring-neutral-900 focus:shadow-outline focus:outline-none"
+          style="width:100%"
           :disabled="loading"
         >
           <span x-show="!loading">Submit</span>
@@ -91,14 +95,14 @@
 
       function state() {
         return {
-          prompt: "{{ prompt | default('a beautiful Japanese temple, butterflies flying around') }}",
+          prompt: "{{ prompt | default('a beautiful Japanese temple') }}",
           image: "{{ image }}",
           features: [],
           submitted: "",
           submittedFeatures: [],
           loading: false,
           imageURL: "",
-          displayLink: '', // image link that will be shared
+          displayLink: "", // image link that will be shared
           id: "{{ id | default('') }}",
           async submitPrompt() {
             if (!this.prompt) return;
@@ -124,9 +128,9 @@
             const data = await response.json();
             const { id, image } = data;
             console.log("Image ID:", id);
-            this.image=image;
-            this.id=id;
-            this.imageURL = 'data:image/png;base64,' + this.image;
+            this.image = image;
+            this.id = id;
+            this.imageURL = "data:image/png;base64," + this.image;
             this.loading = false;
             console.log(this.imageURL);
 
@@ -140,7 +144,7 @@
           init() {
             // When the component initializes, convert the base64 image to a URL
             if (this.image) {
-              this.imageURL = 'data:image/png;base64,' + this.image;
+              this.imageURL = "data:image/png;base64," + this.image;
             }
           },
           toggleFeature(featureName) {
@@ -152,13 +156,14 @@
           copyImageLink() {
             const link = `https://anjaleenaren--stable-diffusion-xl-app.modal.run/image/${this.id}?`;
             this.displayLink = link;
-            navigator.clipboard.writeText(link)
+            navigator.clipboard
+              .writeText(link)
               .then(() => {
-                console.log('Image link copied to clipboard');
+                console.log("Image link copied to clipboard");
                 // You might want to add a user notification here
               })
-              .catch(err => {
-                console.error('Error copying image link to clipboard', err);
+              .catch((err) => {
+                console.error("Error copying image link to clipboard", err);
                 // Handle errors here, such as a fallback to a manual copy-paste prompt
               });
           },
