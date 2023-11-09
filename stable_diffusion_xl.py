@@ -83,7 +83,7 @@ DB_PATH = pathlib.Path(VOLUME_DIR, "image-gen.db")
 
 # TODO: Can speed up inference by switching too A100
 @stub.cls(
-    gpu=gpu.A10G(),
+    gpu=gpu.A100(),
     secrets=[s3_secret],
     container_idle_timeout=240,
     volumes={VOLUME_DIR: stub.volume},
@@ -366,10 +366,11 @@ def main(prompt: str):
 # We can deploy this with `modal deploy stable_diffusion_xl.py`.
 
 frontend_path = Path(__file__).parent / "frontend"
+assets_path = frontend_path / "/public"
 
 
 @stub.function(
-    mounts=[Mount.from_local_dir(frontend_path, remote_path="/assets")],
+    mounts=[Mount.from_local_dir(frontend_path, remote_path="/frontend")],
     allow_concurrent_inputs=20,
     cpu=1,  # default is 0.1, make 1 on live deploy
     volumes={VOLUME_DIR: stub.volume},
@@ -381,9 +382,12 @@ def app():
     from fastapi.responses import HTMLResponse
     from sqlite3 import connect
     from datasette.app import Datasette
+    from fastapi.templating import Jinja2Templates
 
     web_app = FastAPI()
     ds = Datasette(files=[DB_PATH], settings={"sql_time_limit_ms": 10000})
+
+    templates = Jinja2Templates(directory="/frontend")
 
     @web_app.get("/save-new-img/{prompt}")
     async def save_new_image(prompt: str):
@@ -410,12 +414,27 @@ def app():
 
     @web_app.get("/image/{id}", response_class=HTMLResponse)
     async def image(request: Request, id: str):
-        from fastapi.templating import Jinja2Templates
-        templates = Jinja2Templates(directory="/assets")
         response_obj = Model().get_img_from_db.remote(id)
         response_obj['request'] = request
         return templates.TemplateResponse("index.html", response_obj)
 
-    web_app.mount("/", fastapi.staticfiles.StaticFiles(directory="/assets", html=True))
+    # You might also need to add a route for the root URL if you want to serve a page through the template system
+    @web_app.get("/", response_class=HTMLResponse)
+    async def root(request: Request):
+        # If you want to render a template for the root URL, pass the necessary context
+        print("root")
+        content = {
+            "id": "",
+            "s3": "",
+            "metadata": "",
+            "created_at": "",
+            "prompt": "a beautiful Japanese temple, butterflies flying around, realistic, sunset",
+            "image": "",
+            "request": request,
+        }
+        return templates.TemplateResponse("index.html", content)
+    
+    web_app.mount("/", fastapi.staticfiles.StaticFiles(directory="/frontend/public", html=True))
+
 
     return web_app

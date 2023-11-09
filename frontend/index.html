@@ -8,6 +8,7 @@
 
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Image Generator 1.0</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
   </head>
   <body x-data="state()">
     <div class="max-w-3xl mx-auto pt-4 pb-8 px-10 sm:py-12 sm:px-6 lg:px-8">
@@ -28,7 +29,7 @@
         />
         <button
           type="submit"
-          class="inline-flex items-center justify-center px-4 py-3 text-sm font-medium tracking-wide text-white transition-colors duration-200 rounded-md bg-neutral-950 hover:bg-neutral-900 focus:ring-2 focus:ring-offset-2 focus:ring-neutral-900 focus:shadow-outline focus:outline-none"
+          class="inline-flex items-center justify-center px-4 py-3 tracking-wide text-white transition-colors duration-200 rounded-md bg-neutral-950 hover:bg-neutral-900 focus:ring-2 focus:ring-offset-2 focus:ring-neutral-900 focus:shadow-outline focus:outline-none"
           :disabled="loading"
         >
           <span x-show="!loading">Submit</span>
@@ -47,6 +48,7 @@
             </svg>
           </div>
         </button>
+        <!-- <div x-show="displayLink && !loading" class="mt-4 text-center" x-text="displayLink"></div> -->
       </form>
 
       <div class="mx-auto w-full max-w-[768px] relative grid">
@@ -56,13 +58,12 @@
           class="absolute w-full h-full animate-pulse bg-neutral-100 rounded-md"
         ></div>
         <img
-          x-show="imageURL"
+          x-show="imageURL && !loading"
           class="rounded-md self-center justify-self-center"
           :src="'data:image/png;base64,' + image"
-          alt="Generated Image"
         />
         <button
-          x-show="imageURL"
+          x-show="imageURL && !loading"
           class="absolute bottom-0 right-0 p-2 m-2 rounded-md bg-neutral-900 text-white"
           @click="copyImageLink"
         >
@@ -97,12 +98,14 @@
           submittedFeatures: [],
           loading: false,
           imageURL: "",
+          displayLink: '', // image link that will be shared
           id: "{{ id | default('') }}",
           async submitPrompt() {
             if (!this.prompt) return;
             this.submitted = this.prompt;
             this.submittedFeatures = [...this.features];
             this.loading = true;
+            this.displayLink = "";
 
             const queryString = new URLSearchParams(
               this.features.map((f) => ["features", f])
@@ -148,6 +151,7 @@
           },
           copyImageLink() {
             const link = `https://anjaleenaren--stable-diffusion-xl-app.modal.run/image/${this.id}?`;
+            this.displayLink = link;
             navigator.clipboard.writeText(link)
               .then(() => {
                 console.log('Image link copied to clipboard');
